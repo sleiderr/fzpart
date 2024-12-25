@@ -5,7 +5,11 @@
 //!
 //! It limits the number of partition to 4 (without using _EBR_), and the partition sizes to 2 Terabytes at most.
 
-use core::{mem::MaybeUninit, slice};
+use core::{
+    mem::MaybeUninit,
+    ops::{Deref, DerefMut},
+    ptr, slice,
+};
 
 /// Size of the *MBR* header, in bytes.
 pub const MBR_BOOTSTRAP_SIZE: usize = 446;
@@ -32,11 +36,71 @@ pub const MBR_MAGIC_LE: u16 = 0xaa55;
 ///
 /// mbr.update_bootcode(&new_boot);
 /// ```
-#[derive(Debug)]
+#[repr(C, packed(1))]
 pub struct Mbr {
     bootstrap: [u8; MBR_BOOTSTRAP_SIZE],
     partitions: MbrPartitionTable,
     boot_sig: u16,
+}
+
+/// Represents an in-place view of an MBR structure in a mutable buffer.
+///
+/// The `MbrInplace` struct allows you to work with an [`Mbr`] directly
+/// within a raw buffer of bytes. This is useful for low-level operations
+/// where the MBR resides in a contiguous memory buffer, such as a disk
+/// sector or a memory-mapped file.
+///
+/// # Safety
+///
+/// The `MbrInplace` struct assumes the buffer contains valid data for an MBR.
+/// Care must be taken when interpreting or modifying the buffer to avoid
+/// undefined behavior.
+pub struct MbrInplace<'a> {
+    _bytes_buf: &'a mut [u8],
+    mbr: &'a mut Mbr,
+}
+
+impl<'a> MbrInplace<'a> {
+    /// Creates an `MbrInplace` instance from a mutable byte buffer.
+    ///
+    /// The buffer is assumed to contain a valid MBR structure.
+    ///
+    /// # Safety
+    ///
+    /// - The buffer must be large enough to hold an `Mbr` structure.
+    ///
+    /// - This function uses unsafe code to reinterpret the buffer as an `Mbr`.
+    ///   Ensure the buffer contains valid data to avoid undefined behavior.
+    pub fn from_buf(buf: &'a mut [u8]) -> Result<Self, MbrError> {
+        if buf.len() < size_of::<Mbr>() {
+            return Err(MbrError::InvalidBufferSize);
+        }
+
+        let mbr = unsafe { &mut *(buf.as_mut_ptr().cast::<Mbr>()) };
+
+        let mbr_inplace = MbrInplace {
+            _bytes_buf: buf,
+            mbr,
+        };
+
+        mbr_inplace.check_validity()?;
+
+        Ok(mbr_inplace)
+    }
+}
+
+impl DerefMut for MbrInplace<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.mbr
+    }
+}
+
+impl Deref for MbrInplace<'_> {
+    type Target = Mbr;
+
+    fn deref(&self) -> &Self::Target {
+        self.mbr
+    }
 }
 
 /// Error type when dealing with [`Mbr`].
@@ -94,7 +158,7 @@ impl Mbr {
         let partition_table = unsafe {
             let mut uninit_partition_table = MaybeUninit::<MbrPartitionTable>::uninit();
             let part_buffer = slice::from_raw_parts_mut(
-                uninit_partition_table.as_mut_ptr() as *mut u8,
+                uninit_partition_table.as_mut_ptr().cast(),
                 size_of::<MbrPartitionTable>(),
             );
 
@@ -142,7 +206,7 @@ impl Mbr {
         }
 
         unsafe {
-            let mbr_buf = slice::from_raw_parts(self as *const Mbr as *const u8, size_of::<Mbr>());
+            let mbr_buf = slice::from_raw_parts(ptr::from_ref(self).cast(), size_of::<Mbr>());
             buf[0..size_of::<Mbr>()].copy_from_slice(mbr_buf);
         }
 
@@ -230,7 +294,7 @@ impl Mbr {
     /// ```
     /// use fzpart::Mbr;
     ///
-    /// let mbr = Mbr::new();
+    /// let mut mbr = Mbr::new();
     ///
     /// mbr.partitions_mut();
     /// ```
@@ -245,6 +309,8 @@ impl Mbr {
     /// # Examples
     ///
     /// ```
+    /// use fzpart::Mbr;
+    ///
     /// let mbr = Mbr::new();
     ///
     /// mbr.check_validity().unwrap();
@@ -263,6 +329,12 @@ impl Mbr {
     }
 }
 
+impl Default for Mbr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 pub struct MbrPartitionTable {
     partitions: [MbrPartition; 4],
@@ -277,6 +349,7 @@ impl MbrPartitionTable {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[repr(C, packed(1))]
 pub struct MbrPartition {
     attributes: u8,
     chs_start: [u8; 3],
@@ -285,6 +358,8 @@ pub struct MbrPartition {
     lba_start: u32,
     sectors_count: u32,
 }
+
+impl MbrPartition {}
 
 #[cfg(test)]
 mod tests {
