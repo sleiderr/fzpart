@@ -1,5 +1,11 @@
 [package]
 name = "fzpart"
+description = "A Rust library to interact with GPT / MBR partition tables."
+license-file = "LICENSE"
+authors = ["Sacha Dupuydauby <sdupuydauby@proton.me>"]
+keywords = ["mbr", "gpt", "partition", "boot"]
+categories = ["filesystem", "no-std"]
+repository = "https://github.com/sleiderr/fzpart"
 version = "0.1.0"
 edition = "2024"
 
