@@ -36,10 +36,17 @@ pub const MBR_MAGIC_LE: u16 = 0xaa55;
 ///
 /// mbr.update_bootcode(&new_boot);
 /// ```
+#[derive(Debug)]
 #[repr(C, packed(1))]
 pub struct Mbr {
     bootstrap: [u8; MBR_BOOTSTRAP_SIZE],
-    partitions: MbrPartitionTable,
+
+    /// Partition table for this `Mbr`.
+    ///
+    /// The partition table contains entries describing up to four primary partitions
+    /// in the Master Boot Record (MBR).
+    pub partitions: [MbrPartition; 4],
+
     boot_sig: u16,
 }
 
@@ -114,6 +121,7 @@ pub enum MbrError {
 
     /// The provided bootcode was too large for the bootstrap field in this [`Mbr`].
     BootcodeTooLarge,
+    InvalidPartition,
 }
 
 impl Mbr {
@@ -130,7 +138,7 @@ impl Mbr {
     pub fn new() -> Self {
         Self {
             bootstrap: [0u8; MBR_BOOTSTRAP_SIZE],
-            partitions: MbrPartitionTable::new(),
+            partitions: [MbrPartition::default(); 4],
             boot_sig: MBR_MAGIC_LE,
         }
     }
@@ -156,14 +164,14 @@ impl Mbr {
         }
 
         let partition_table = unsafe {
-            let mut uninit_partition_table = MaybeUninit::<MbrPartitionTable>::uninit();
+            let mut uninit_partition_table = MaybeUninit::<[MbrPartition; 4]>::uninit();
             let part_buffer = slice::from_raw_parts_mut(
                 uninit_partition_table.as_mut_ptr().cast(),
-                size_of::<MbrPartitionTable>(),
+                4 * size_of::<MbrPartition>(),
             );
 
             part_buffer.copy_from_slice(
-                &buf[MBR_BOOTSTRAP_SIZE..MBR_BOOTSTRAP_SIZE + size_of::<MbrPartitionTable>()],
+                &buf[MBR_BOOTSTRAP_SIZE..MBR_BOOTSTRAP_SIZE + 4 * size_of::<MbrPartition>()],
             );
 
             uninit_partition_table.assume_init()
@@ -261,47 +269,6 @@ impl Mbr {
         Ok(())
     }
 
-    /// Returns a reference to the partition table in this `Mbr`.
-    ///
-    /// The partition table contains entries describing up to four primary partitions
-    /// in the Master Boot Record (_MBR_).
-    ///
-    /// # Notes
-    ///
-    /// This function provides read-only access to the partition table.
-    /// To modify the partition table, use [`Mbr::partitions_mut`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use fzpart::Mbr;
-    ///
-    /// let mbr = Mbr::new();
-    ///
-    /// mbr.partitions();
-    /// ```
-    pub fn partitions(&self) -> &MbrPartitionTable {
-        &self.partitions
-    }
-
-    /// Returns a mutable reference to the partition table in this MBR.
-    ///
-    /// The partition table contains entries describing up to four primary partitions
-    /// in the Master Boot Record (MBR). This function allows you to modify those entries.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use fzpart::Mbr;
-    ///
-    /// let mut mbr = Mbr::new();
-    ///
-    /// mbr.partitions_mut();
-    /// ```
-    pub fn partitions_mut(&mut self) -> &mut MbrPartitionTable {
-        &mut self.partitions
-    }
-
     /// Checks if this MBR is valid (correct signature, ...).
     ///
     /// Returns an error describing what is wrong if it's not a valid MBR.
@@ -335,79 +302,332 @@ impl Default for Mbr {
     }
 }
 
-#[derive(Debug)]
-pub struct MbrPartitionTable {
-    partitions: [MbrPartition; 4],
-}
-
-impl MbrPartitionTable {
-    fn new() -> Self {
-        Self {
-            partitions: [MbrPartition::default(); 4],
-        }
-    }
-}
-
+/// Represents an individual partition entry in an MBR partition table.
+///
+/// The MBR partition table can contain up to four such entries, each describing
+/// a primary partition's attributes, location, and size. This struct is designed
+/// to match the exact layout of an MBR partition entry on disk.
+///
+/// # Examples
+///
+/// ```
+/// use fzpart::Mbr;
+/// use fzpart::mbr::MbrPartitionType;
+///
+/// let mut mbr = Mbr::new();
+///
+/// mbr.partitions[0].set_sectors_count(1024);
+/// mbr.partitions[0].set_partition_type(MbrPartitionType::LinuxNative);
+///
+/// assert!(mbr.partitions[0].is_used());
+/// ```
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C, packed(1))]
 pub struct MbrPartition {
     attributes: u8,
+
     chs_start: [u8; 3],
     part_type: u8,
     chs_last: [u8; 3],
-    lba_start: u32,
+
+    start_lba: u32,
     sectors_count: u32,
 }
 
-impl MbrPartition {}
+impl MbrPartition {
+    /// Returns `Some(true)` if this partition is flagged as _active_ (or bootable).
+    ///
+    /// Only one partition should be active in a [`Mbr`]
+    ///
+    /// # Errors
+    ///
+    /// This function will return [`MbrError::InvalidPartition`] if the partition contains an
+    /// invalid value in its _active_ field.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fzpart::Mbr;
+    ///
+    /// let mbr = Mbr::new();
+    ///
+    /// assert!(!mbr.partitions[0].is_active().unwrap());
+    /// ```
+    pub fn is_active(&self) -> Result<bool, MbrError> {
+        match self.attributes {
+            0 => Ok(false),
+            (0x80..0x8F) => Ok(true),
+            _ => Err(MbrError::InvalidPartition),
+        }
+    }
+
+    /// Sets the _active_ (or bootable) flag for this partition.
+    ///
+    /// Only one partition should be active in a [`Mbr`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fzpart::Mbr;
+    ///
+    /// let mut mbr = Mbr::new();
+    /// mbr.partitions[0].set_active(true);
+    ///
+    /// assert!(mbr.partitions[0].is_active().unwrap());
+    /// ```
+    #[inline]
+    pub fn set_active(&mut self, active: bool) {
+        self.attributes = if active { 0x80 } else { 0 }
+    }
+
+    /// Returns `true` if this entry corresponds to a valid partition.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fzpart::Mbr;
+    /// use fzpart::mbr::MbrPartitionType;
+    ///
+    /// let mut mbr = Mbr::new();
+    ///
+    /// assert!(!mbr.partitions[0].is_used());
+    ///
+    /// mbr.partitions[0].set_sectors_count(1024);
+    /// mbr.partitions[0].set_partition_type(MbrPartitionType::LinuxNative);
+    ///
+    /// assert!(mbr.partitions[0].is_used());
+    /// ```
+    pub fn is_used(&self) -> bool {
+        self.part_type != 0 && self.sectors_count != 0
+    }
+
+    /// Returns the size of this partition, in sectors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fzpart::Mbr;
+    ///
+    /// let mbr = Mbr::new();
+    ///
+    /// assert_eq!(mbr.partitions[0].sectors_count(), 0);
+    /// ```
+    #[inline]
+    pub fn sectors_count(&self) -> u32 {
+        self.sectors_count
+    }
+
+    /// Sets the size of this partition, in sectors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fzpart::Mbr;
+    ///
+    /// let mut mbr = Mbr::new();
+    ///
+    /// mbr.partitions[0].set_sectors_count(1024);
+    ///
+    /// assert_eq!(mbr.partitions[0].sectors_count(), 1024);
+    /// ```
+    #[inline]
+    pub fn set_sectors_count(&mut self, count: u32) {
+        self.sectors_count = count;
+    }
+
+    /// Returns this partition's starting LBA.
+    ///
+    /// The _LBA_ is encoded using 32 bits, which limits the maximum partition size to 2TB.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fzpart::Mbr;
+    ///
+    /// let mbr = Mbr::new();
+    ///
+    /// assert_eq!(mbr.partitions[0].start_lba(), 0);
+    /// ```
+    #[inline]
+    pub fn start_lba(&self) -> u32 {
+        self.start_lba
+    }
+
+    /// Sets this partition's starting LBA.
+    ///
+    /// The _LBA_ is encoded using 32 bits, which limits the maximum partition size to 2TB.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fzpart::Mbr;
+    ///
+    /// let mut mbr = Mbr::new();
+    ///
+    /// mbr.partitions[0].set_start_lba(1024);
+    ///
+    /// assert_eq!(mbr.partitions[0].start_lba(), 1024);
+    /// ```
+    #[inline]
+    pub fn set_start_lba(&mut self, lba: u32) {
+        self.start_lba = lba;
+    }
+
+    /// Returns the [`MbrPartitionType`] for this partition.
+    ///
+    /// It is intended to specify the filesystem contained in this partition, but there is no clear
+    /// standard.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fzpart::Mbr;
+    /// use fzpart::mbr::MbrPartitionType;
+    ///
+    /// let mbr = Mbr::new();
+    ///
+    /// assert!(matches!(mbr.partitions[0].partition_type(), MbrPartitionType::Empty));
+    /// ```
+    #[inline]
+    pub fn partition_type(&self) -> MbrPartitionType {
+        self.part_type.into()
+    }
+
+    /// Sets the [`MbrPartitionType`] for this partition.
+    ///
+    /// It is intended to specify the filesystem contained in this partition, but there is no clear
+    /// standard.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fzpart::Mbr;
+    /// use fzpart::mbr::MbrPartitionType;
+    ///
+    /// let mut mbr = Mbr::new();
+    ///
+    /// mbr.partitions[0].set_partition_type(MbrPartitionType::LinuxNative);
+    ///
+    /// assert!(matches!(mbr.partitions[0].partition_type(), MbrPartitionType::LinuxNative));
+    /// ```
+    #[inline]
+    pub fn set_partition_type(&mut self, part_type: MbrPartitionType) {
+        self.part_type = part_type.into();
+    }
+}
+
+/// Known partition IDs for various filesystems, used in MBR partition entries.
+pub enum MbrPartitionType {
+    Empty,
+    DOSFat12,
+    XenixRoot,
+    XenixUsr,
+    DOS3Fat16,
+    Extended,
+    DOS331Fat16,
+    OS2IFS,
+    NTFS,
+    Fat32,
+    Fat32LBA,
+    EXFAT,
+    DOSFat16LBA,
+    ExtendedLBA,
+    LinuxSwap,
+    LinuxNative,
+    LinuxExtended,
+    LinuxLVM,
+    BSDI,
+    OpenBSD,
+    MacOSX,
+    MacOSXBoot,
+    MacOSXHFS,
+    LUKS,
+    GPT,
+    EFI,
+    Unknown,
+}
+
+impl From<MbrPartitionType> for u8 {
+    fn from(value: MbrPartitionType) -> Self {
+        match value {
+            MbrPartitionType::Empty => 0,
+            MbrPartitionType::DOSFat12 => 1,
+            MbrPartitionType::XenixRoot => 2,
+            MbrPartitionType::XenixUsr => 3,
+            MbrPartitionType::DOS3Fat16 => 4,
+            MbrPartitionType::Extended => 5,
+            MbrPartitionType::DOS331Fat16 => 6,
+            MbrPartitionType::OS2IFS => 7,
+            MbrPartitionType::NTFS => 7,
+            MbrPartitionType::EXFAT => 7,
+            MbrPartitionType::Fat32 => 0xB,
+            MbrPartitionType::Fat32LBA => 0xC,
+            MbrPartitionType::DOSFat16LBA => 0xE,
+            MbrPartitionType::ExtendedLBA => 0xF,
+            MbrPartitionType::LinuxSwap => 0x82,
+            MbrPartitionType::LinuxNative => 0x83,
+            MbrPartitionType::LinuxExtended => 0x85,
+            MbrPartitionType::LinuxLVM => 0x8E,
+            MbrPartitionType::BSDI => 0x9F,
+            MbrPartitionType::OpenBSD => 0xA6,
+            MbrPartitionType::MacOSX => 0xA8,
+            MbrPartitionType::MacOSXBoot => 0xAB,
+            MbrPartitionType::MacOSXHFS => 0xAF,
+            MbrPartitionType::LUKS => 0xE8,
+            MbrPartitionType::GPT => 0xEE,
+            MbrPartitionType::EFI => 0xEF,
+            MbrPartitionType::Unknown => 0xEA,
+        }
+    }
+}
+
+impl From<u8> for MbrPartitionType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Empty,
+            1 => Self::DOSFat12,
+            2 => Self::XenixRoot,
+            3 => Self::XenixUsr,
+            4 => Self::DOS3Fat16,
+            5 => Self::Extended,
+            6 => Self::DOS331Fat16,
+            7 => Self::NTFS,
+            0xB => Self::Fat32,
+            0xC => Self::Fat32LBA,
+            0xE => Self::DOSFat16LBA,
+            0xF => Self::ExtendedLBA,
+            0x82 => Self::LinuxSwap,
+            0x83 => Self::LinuxNative,
+            0x85 => Self::LinuxExtended,
+            0x8E => Self::LinuxLVM,
+            0x9F => Self::BSDI,
+            0xA6 => Self::OpenBSD,
+            0xA8 => Self::MacOSX,
+            0xAB => Self::MacOSXBoot,
+            0xAF => Self::MacOSXHFS,
+            0xE8 => Self::LUKS,
+            0xEE => Self::GPT,
+            0xEF => Self::EFI,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use crate::mbr::MbrPartitionType;
+
     use super::Mbr;
     extern crate std;
-    use std::prelude::*;
+    use base64::prelude::*;
 
-    const DUMMY_MBR: [u8; 0x200] = [
-        0x33, 0xed, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-        0x90, 0x90, 0x33, 0xed, 0xfa, 0x8e, 0xd5, 0xbc, 0x00, 0x7c, 0xfb, 0xfc, 0x66, 0x31, 0xdb,
-        0x66, 0x31, 0xc9, 0x66, 0x53, 0x66, 0x51, 0x06, 0x57, 0x8e, 0xdd, 0x8e, 0xc5, 0x52, 0xbe,
-        0x00, 0x7c, 0xbf, 0x00, 0x06, 0xb9, 0x00, 0x01, 0xf3, 0xa5, 0xea, 0x4b, 0x06, 0x00, 0x00,
-        0x52, 0xb4, 0x41, 0xbb, 0xaa, 0x55, 0x31, 0xc9, 0x30, 0xf6, 0xf9, 0xcd, 0x13, 0x72, 0x16,
-        0x81, 0xfb, 0x55, 0xaa, 0x75, 0x10, 0x83, 0xe1, 0x01, 0x74, 0x0b, 0x66, 0xc7, 0x06, 0xf3,
-        0x06, 0xb4, 0x42, 0xeb, 0x15, 0xeb, 0x02, 0x31, 0xc9, 0x5a, 0x51, 0xb4, 0x08, 0xcd, 0x13,
-        0x5b, 0x0f, 0xb6, 0xc6, 0x40, 0x50, 0x83, 0xe1, 0x3f, 0x51, 0xf7, 0xe1, 0x53, 0x52, 0x50,
-        0xbb, 0x00, 0x7c, 0xb9, 0x04, 0x00, 0x66, 0xa1, 0xb0, 0x07, 0xe8, 0x44, 0x00, 0x0f, 0x82,
-        0x80, 0x00, 0x66, 0x40, 0x80, 0xc7, 0x02, 0xe2, 0xf2, 0x66, 0x81, 0x3e, 0x40, 0x7c, 0xfb,
-        0xc0, 0x78, 0x70, 0x75, 0x09, 0xfa, 0xbc, 0xec, 0x7b, 0xea, 0x44, 0x7c, 0x00, 0x00, 0xe8,
-        0x83, 0x00, 0x69, 0x73, 0x6f, 0x6c, 0x69, 0x6e, 0x75, 0x78, 0x2e, 0x62, 0x69, 0x6e, 0x20,
-        0x6d, 0x69, 0x73, 0x73, 0x69, 0x6e, 0x67, 0x20, 0x6f, 0x72, 0x20, 0x63, 0x6f, 0x72, 0x72,
-        0x75, 0x70, 0x74, 0x2e, 0x0d, 0x0a, 0x66, 0x60, 0x66, 0x31, 0xd2, 0x66, 0x03, 0x06, 0xf8,
-        0x7b, 0x66, 0x13, 0x16, 0xfc, 0x7b, 0x66, 0x52, 0x66, 0x50, 0x06, 0x53, 0x6a, 0x01, 0x6a,
-        0x10, 0x89, 0xe6, 0x66, 0xf7, 0x36, 0xe8, 0x7b, 0xc0, 0xe4, 0x06, 0x88, 0xe1, 0x88, 0xc5,
-        0x92, 0xf6, 0x36, 0xee, 0x7b, 0x88, 0xc6, 0x08, 0xe1, 0x41, 0xb8, 0x01, 0x02, 0x8a, 0x16,
-        0xf2, 0x7b, 0xcd, 0x13, 0x8d, 0x64, 0x10, 0x66, 0x61, 0xc3, 0xe8, 0x1e, 0x00, 0x4f, 0x70,
-        0x65, 0x72, 0x61, 0x74, 0x69, 0x6e, 0x67, 0x20, 0x73, 0x79, 0x73, 0x74, 0x65, 0x6d, 0x20,
-        0x6c, 0x6f, 0x61, 0x64, 0x20, 0x65, 0x72, 0x72, 0x6f, 0x72, 0x2e, 0x0d, 0x0a, 0x5e, 0xac,
-        0xb4, 0x0e, 0x8a, 0x3e, 0x62, 0x04, 0xb3, 0x07, 0xcd, 0x10, 0x3c, 0x0a, 0x75, 0xf1, 0xcd,
-        0x18, 0xf4, 0xeb, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xec, 0x01, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0xf6, 0xe6, 0x6e, 0x08, 0x00, 0x00, 0x80, 0x01, 0x02, 0x00,
-        0x00, 0xab, 0xff, 0xff, 0x40, 0x00, 0x00, 0x00, 0xc0, 0x4f, 0xa9, 0x00, 0x00, 0xab, 0xff,
-        0xff, 0xef, 0xab, 0xff, 0xff, 0x00, 0x50, 0xa9, 0x00, 0x00, 0x58, 0x05, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x55, 0xaa,
-    ];
+    const DUMMY_MBR: &str = "M+2QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJAz7fqO1bwAfPv8ZjHbZjHJZlNmUQZXjt2OxVK+AHy/AAa5AAHzpepLBgAAUrRBu6pVMckw9vnNE3IWgftVqnUQg+EBdAtmxwbzBrRC6xXrAjHJWlG0CM0TWw+2xkBQg+E/UffhU1JQuwB8uQQAZqGwB+hEAA+CgABmQIDHAuLyZoE+QHz7wHhwdQn6vOx76kR8AADogwBpc29saW51eC5iaW4gbWlzc2luZyBvciBjb3JydXB0Lg0KZmBmMdJmAwb4e2YTFvx7ZlJmUAZTagFqEInmZvc26HvA5AaI4YjFkvY27nuIxgjhQbgBAooW8nvNE41kEGZhw+geAE9wZXJhdGluZyBzeXN0ZW0gbG9hZCBlcnJvci4NCl6stA6KPmIEswfNEDwKdfHNGPTr/QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA7AEAAAAAAAD25m4IAACAAQIAAKv//0AAAADAT6kAAKv//++r//8AUKkAAFgFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVao=";
 
     #[test]
     pub fn parse_standard_mbr_from_buffer() {
-        Mbr::parse_from_buf(&DUMMY_MBR).unwrap();
+        let mbr_bytes = BASE64_STANDARD.decode(DUMMY_MBR).unwrap();
+
+        Mbr::parse_from_buf(&mbr_bytes).unwrap();
     }
 
     #[test]
@@ -418,5 +638,29 @@ mod tests {
         mbr.write(&mut buf).unwrap();
 
         Mbr::parse_from_buf(&buf).unwrap();
+    }
+
+    #[test]
+    pub fn read_partition_table() {
+        let mbr_bytes = BASE64_STANDARD.decode(DUMMY_MBR).unwrap();
+
+        let mbr = Mbr::parse_from_buf(&mbr_bytes).unwrap();
+
+        assert!(mbr.partitions[0].is_active().unwrap());
+        assert!(!mbr.partitions[1].is_active().unwrap());
+
+        assert_eq!(mbr.partitions[0].sectors_count(), 11096000);
+        assert_eq!(mbr.partitions[0].start_lba(), 64);
+
+        assert_eq!(mbr.partitions[1].sectors_count(), 350208);
+        assert_eq!(
+            mbr.partitions[1].start_lba(),
+            mbr.partitions[0].start_lba() + mbr.partitions[0].sectors_count
+        );
+
+        assert!(matches!(
+            mbr.partitions[1].partition_type(),
+            MbrPartitionType::EFI
+        ));
     }
 }
