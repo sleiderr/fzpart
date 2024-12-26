@@ -10,6 +10,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+crc32fast = { version = "1.4.2", default-features = false }
+static_assertions = "1.1.0"
 
 [dev-dependencies]
 base64 = "0.22"
+
+[features]
+default = ["std"]
+std = []

@@ -221,6 +221,31 @@ impl Mbr {
         Ok(())
     }
 
+    /// Returns `true` if this `MBR` is a protective `MBR`.
+    ///
+    /// Following the `UEFI` specifications, a drive containing a GPT will
+    /// also contain a protective MBR for compatibility purposes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fzpart::Mbr;
+    /// use fzpart::mbr::MbrPartitionType;
+    ///
+    /// let mut mbr = Mbr::new();
+    /// mbr.partitions[0].set_partition_type(MbrPartitionType::GPT);
+    /// mbr.partitions[0].set_sectors_count(0x1000);
+    ///
+    /// assert!(mbr.is_protective_mbr());
+    /// ```
+    pub fn is_protective_mbr(&self) -> bool {
+        !self.partitions[1].is_used()
+            && !self.partitions[2].is_used()
+            && !self.partitions[3].is_used()
+            && self.partitions[0].is_used()
+            && matches!(self.partitions[0].partition_type(), MbrPartitionType::GPT)
+    }
+
     /// Returns the bootstrap code contained in this MBR.
     ///
     /// The bootstrap code, is the executable code stored in the first 446 bytes
@@ -557,9 +582,7 @@ impl From<MbrPartitionType> for u8 {
             MbrPartitionType::DOS3Fat16 => 4,
             MbrPartitionType::Extended => 5,
             MbrPartitionType::DOS331Fat16 => 6,
-            MbrPartitionType::OS2IFS => 7,
-            MbrPartitionType::NTFS => 7,
-            MbrPartitionType::EXFAT => 7,
+            MbrPartitionType::OS2IFS | MbrPartitionType::NTFS | MbrPartitionType::EXFAT => 7,
             MbrPartitionType::Fat32 => 0xB,
             MbrPartitionType::Fat32LBA => 0xC,
             MbrPartitionType::DOSFat16LBA => 0xE,
