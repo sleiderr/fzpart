@@ -17,5 +17,6 @@ static_assertions = "1.1.0"
 base64 = "0.22"
 
 [features]
+std = ["alloc", "crc32fast/std"]
+alloc = []
 default = ["std"]
-std = []
