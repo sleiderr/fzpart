@@ -7,6 +7,7 @@ use core::{
 
 #[cfg(feature = "alloc")]
 use alloc::{string::String, vec::Vec};
+use crc32fast::Hasher;
 
 use crate::{DiskRead, DiskSeek, DiskWrite, SeekFrom, packed_field_accessors};
 
@@ -15,13 +16,21 @@ const GPT_SIG: &[u8; 8] = b"EFI PART";
 
 #[derive(Clone, Copy, Debug)]
 pub enum GptError {
-    InvalidPartition,
+    InvalidPartition(u32, GptPartitionError),
     IoError,
     InvalidHeaderChecksum(u32, u32),
+    InvalidPartitionsChecksum(u32, u32),
     InvalidSignature,
     NoSuchPartition,
     OutOfBounds,
     TableFull,
+    OverlappingPartitions,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum GptPartitionError {
+    InvalidLbaRange,
+    InvalidName,
 }
 
 #[derive(Debug)]
@@ -122,7 +131,7 @@ impl GptHeader {
     packed_field_accessors!(partition_entries_checksum, u32, pub(self));
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 #[repr(packed(1), C)]
 pub struct GptPartition {
     /// Defines the purpose and type of this partition.
@@ -164,13 +173,21 @@ impl GptPartition {
         self.type_guid != 0
     }
 
+    pub fn check_correctness(&self) -> Result<(), GptPartitionError> {
+        if self.start_lba() > self.last_lba() {
+            return Err(GptPartitionError::InvalidLbaRange);
+        }
+
+        Ok(())
+    }
+
     #[cfg(feature = "alloc")]
-    pub fn name(&self) -> Result<String, GptError> {
+    pub fn name(&self) -> Result<String, GptPartitionError> {
         unsafe {
             let name_buf = read_unaligned(addr_of!(self.partition_name));
             let filtered_buf: Vec<u16> = name_buf.into_iter().take_while(|&c| c != 0).collect();
 
-            String::from_utf16(&filtered_buf).map_err(|_| GptError::InvalidPartition)
+            String::from_utf16(&filtered_buf).map_err(|_| GptPartitionError::InvalidName)
         }
     }
 
@@ -223,10 +240,12 @@ where
 
         header.is_valid()?;
 
-        Ok(Gpt {
+        let table = Gpt {
             header,
             device_mapping: RefCell::new(device_mapping),
-        })
+        };
+
+        Ok(table)
     }
 
     pub fn get_partition(&self, part_id: u32) -> Result<GptPartition, GptError> {
@@ -243,11 +262,105 @@ where
         }
     }
 
+    pub fn compute_partitions_checksum(&self) -> u32 {
+        let mut crc32_hasher = Hasher::new();
+
+        unsafe {
+            self.iter_entries().for_each(|part| {
+                crc32_hasher.update(slice::from_raw_parts(
+                    addr_of!(part).cast(),
+                    size_of::<GptPartition>(),
+                ))
+            });
+        }
+
+        crc32_hasher.finalize()
+    }
+
+    pub fn update_checksums(&mut self) {
+        let partitions_chksum = self.compute_partitions_checksum();
+        let header_chksum = self.header.compute_checksum();
+
+        self.header.checksum = header_chksum;
+        self.header.partition_entries_checksum = partitions_chksum;
+    }
+
+    pub fn check_table_correctness(&self) -> Result<(), GptError> {
+        self.header.is_valid()?;
+
+        let expected_checksum = self.compute_partitions_checksum();
+
+        if expected_checksum != self.header.partition_entries_checksum {
+            return Err(GptError::InvalidPartitionsChecksum(
+                expected_checksum,
+                self.header.partition_entries_checksum(),
+            ));
+        }
+
+        #[cfg(feature = "alloc")]
+        {
+            let overlappings =
+                self.find_overlapping_partitions(self.iter_partitions().collect::<Vec<_>>());
+
+            if !overlappings.is_empty() {
+                return Err(GptError::OverlappingPartitions);
+            }
+        }
+
+        for (part, idx) in self.iter_partitions().zip(0u32..) {
+            part.check_correctness()
+                .map_err(|err| GptError::InvalidPartition(idx, err))?;
+        }
+
+        Ok(())
+    }
+
+    fn would_new_partitions_overlap(&self, new_part: Vec<GptPartition>) -> bool {
+        let mut partitions = self.iter_partitions().collect::<Vec<_>>();
+        partitions.extend(new_part.into_iter());
+
+        let overlappings = self.find_overlapping_partitions(partitions);
+
+        !overlappings.is_empty()
+    }
+
+    #[cfg(feature = "alloc")]
+    fn find_overlapping_partitions(
+        &self,
+        mut partitions: Vec<GptPartition>,
+    ) -> Vec<Vec<GptPartition>> {
+        partitions.sort_by(|part_a, part_b| part_a.start_lba().cmp(&part_b.start_lba()));
+
+        let mut partitions_groups: Vec<Vec<GptPartition>> = Vec::with_capacity(partitions.len());
+        let mut curr_group_end = 0;
+
+        for part in partitions {
+            if part.start_lba() >= curr_group_end {
+                curr_group_end = part.last_lba();
+                partitions_groups.push(alloc::vec![part]);
+                continue;
+            }
+
+            if part.start_lba() < curr_group_end {
+                curr_group_end = core::cmp::max(part.last_lba(), curr_group_end);
+                partitions_groups.last_mut().unwrap().push(part);
+            }
+        }
+
+        partitions_groups.retain(|grp| grp.len() > 1);
+
+        partitions_groups
+    }
+
     fn read_partition_entry(&self, part_id: u32) -> Result<GptPartition, GptError> {
         self.device_mapping
             .borrow_mut()
             .seek(SeekFrom::Start(self.partition_offset(part_id)))
             .map_err(|_| GptError::IoError)?;
+
+        if part_id >= self.header.partition_entry_size() {
+            return Err(GptError::OutOfBounds);
+        }
 
         let part = unsafe {
             let mut uninit_part: MaybeUninit<GptPartition> = MaybeUninit::uninit();
@@ -319,6 +432,12 @@ where
     pub fn append_partition(&mut self, new_part: GptPartition) -> Result<(), GptError> {
         let empty_idx = self.find_first_empty_slot().ok_or(GptError::TableFull)?;
 
+        #[cfg(feature = "alloc")]
+        {
+            if self.would_new_partitions_overlap(alloc::vec![new_part]) {
+                return Err(GptError::OverlappingPartitions);
+            }
+        }
         self.write_partition_entry(empty_idx, new_part)
     }
 
@@ -333,7 +452,29 @@ where
             .filter(|(part, _)| part.is_used())
             .nth(usize::try_from(part_id).map_err(|_| GptError::OutOfBounds)?)
             .ok_or(GptError::NoSuchPartition)?;
+        new_part
+            .check_correctness()
+            .map_err(|err| GptError::InvalidPartition(part_id, err))?;
 
+        #[cfg(feature = "alloc")]
+        {
+            let mut partitions = self
+                .iter_partitions()
+                .enumerate()
+                .filter_map(|(idx, part)| {
+                    if idx != usize::try_from(part_id).unwrap_or(0) {
+                        return Some(part);
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            partitions.push(new_part);
+
+            if !self.find_overlapping_partitions(partitions).is_empty() {
+                return Err(GptError::OverlappingPartitions);
+            }
+        }
         self.write_partition_entry(idx, new_part)
     }
 
@@ -397,14 +538,13 @@ mod tests {
     use std::{io::Cursor, vec::Vec};
 
     use super::Gpt;
-    use base64::prelude::*;
 
-    const GPT_DISK_DUMP: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA7gAAAAEAAAD/BwQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVapFRkkgUEFSVAAAAQBcAAAAWaj9XQAAAAABAAAAAAAAAP8HBAAAAAAAIgAAAAAAAADeBwQAAAAAABSWWrX/9bRAqBnTWMJ7e4QCAAAAAAAAAIAAAACAAAAAAVHo0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK89xg+DhHJHjnk9adhHfeTgKQeQ2MI7RriK9NAozzsNKAAAAAAAAAAnAAIAAAAAAAAAAAAAAAAAcABhAHIAdABfAGEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAArz3GD4OEckeOeT1p2Ed95EKe9HINBAxMkRpP2yjM5FYoAAIAAAAAACcABAAAAAAAAAAAAAAAAABwAGEAcgB0AF8AYgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const GPT_DUMP: &[u8] = include_bytes!("../tests/dummy_gpt.bin");
 
     #[test]
     pub fn parse_gpt_from_buf() {
-        let gpt_dump = Cursor::new(BASE64_STANDARD.decode(GPT_DISK_DUMP).unwrap());
-        let gpt: Gpt<Cursor<Vec<u8>>> = Gpt::parse_from_device(gpt_dump).unwrap();
+        let gpt_dump = Cursor::new(GPT_DUMP);
+        let gpt: Gpt<Cursor<&[u8]>> = Gpt::parse_from_device(gpt_dump).unwrap();
 
         assert_eq!(gpt.header.partition_entries_count(), 128);
         assert_eq!(gpt.header.lba(), 1);
@@ -413,8 +553,8 @@ mod tests {
 
     #[test]
     pub fn parse_gpt_partitions() {
-        let gpt_dump = Cursor::new(BASE64_STANDARD.decode(GPT_DISK_DUMP).unwrap());
-        let gpt: Gpt<Cursor<Vec<u8>>> = Gpt::parse_from_device(gpt_dump).unwrap();
+        let gpt_dump = Cursor::new(GPT_DUMP);
+        let gpt: Gpt<Cursor<&[u8]>> = Gpt::parse_from_device(gpt_dump).unwrap();
 
         for part in gpt.iter_partitions() {
             assert!(part.is_used());
@@ -430,12 +570,35 @@ mod tests {
     }
 
     #[test]
-    pub fn gpt_append_partition() {
-        let gpt_dump = Cursor::new(BASE64_STANDARD.decode(GPT_DISK_DUMP).unwrap());
+    pub fn gpt_partitions_checksum() {
+        let gpt_dump = Cursor::new(GPT_DUMP);
+        let gpt: Gpt<Cursor<&[u8]>> = Gpt::parse_from_device(gpt_dump).unwrap();
+
+        assert_eq!(
+            gpt.compute_partitions_checksum(),
+            gpt.header.partition_entries_checksum()
+        );
+    }
+
+    #[test]
+    pub fn gpt_partition_overlapping_check() {
+        let gpt_dump = Cursor::new(GPT_DUMP.iter().cloned().collect::<Vec<_>>());
         let mut gpt: Gpt<Cursor<Vec<u8>>> = Gpt::parse_from_device(gpt_dump).unwrap();
 
         let mut part_a = gpt.get_partition(0).unwrap();
         part_a.set_start_lba(2727);
+
+        gpt.update_partition(0, part_a).unwrap();
+    }
+
+    #[test]
+    pub fn gpt_append_partition() {
+        let gpt_dump = Cursor::new(GPT_DUMP.iter().cloned().collect::<Vec<_>>());
+        let mut gpt: Gpt<Cursor<Vec<u8>>> = Gpt::parse_from_device(gpt_dump).unwrap();
+
+        let mut part_a = gpt.get_partition(0).unwrap();
+        part_a.set_start_lba(27272727);
+        part_a.set_last_lba(27272728);
 
         gpt.append_partition(part_a).unwrap();
 
@@ -443,14 +606,16 @@ mod tests {
 
         let partitions = gpt.iter_partitions().collect::<Vec<_>>();
 
+        std::println!("{:?}", partitions);
+
         assert_eq!(partitions[2].name().unwrap(), "part_a");
 
-        assert_eq!(partitions[2].start_lba(), 2727);
+        assert_eq!(partitions[2].start_lba(), 27272727);
     }
 
     #[test]
     pub fn gpt_update_partition() {
-        let gpt_dump = Cursor::new(BASE64_STANDARD.decode(GPT_DISK_DUMP).unwrap());
+        let gpt_dump = Cursor::new(GPT_DUMP.iter().cloned().collect::<Vec<_>>());
         let mut gpt: Gpt<Cursor<Vec<u8>>> = Gpt::parse_from_device(gpt_dump).unwrap();
 
         let mut part_a = gpt.get_partition(0).unwrap();
@@ -467,7 +632,7 @@ mod tests {
 
     #[test]
     pub fn gpt_remove_partition() {
-        let gpt_dump = Cursor::new(BASE64_STANDARD.decode(GPT_DISK_DUMP).unwrap());
+        let gpt_dump = Cursor::new(GPT_DUMP.iter().cloned().collect::<Vec<_>>());
         let mut gpt: Gpt<Cursor<Vec<u8>>> = Gpt::parse_from_device(gpt_dump).unwrap();
 
         gpt.remove_partition(0).unwrap();
