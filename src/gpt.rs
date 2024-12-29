@@ -182,6 +182,21 @@ impl GptPartition {
     }
 
     #[cfg(feature = "alloc")]
+    pub fn set_name(&mut self, name: &str) -> Result<(), GptPartitionError> {
+        let mut utf16_encoding = name.encode_utf16().collect::<Vec<_>>();
+
+        if utf16_encoding.len() >= 36 {
+            return Err(GptPartitionError::InvalidName);
+        }
+
+        utf16_encoding.resize(36, 0);
+
+        self.set_partition_name(utf16_encoding.try_into().unwrap());
+
+        Ok(())
+    }
+
+    #[cfg(feature = "alloc")]
     pub fn name(&self) -> Result<String, GptPartitionError> {
         unsafe {
             let name_buf = read_unaligned(addr_of!(self.partition_name));
@@ -194,6 +209,7 @@ impl GptPartition {
     packed_field_accessors!(type_guid, set_type_guid, u128);
     packed_field_accessors!(start_lba, set_start_lba, u64);
     packed_field_accessors!(last_lba, set_last_lba, u64);
+    packed_field_accessors!(partition_name, set_partition_name, [u16; 36], pub(self));
 }
 
 impl Default for GptPartition {
@@ -387,7 +403,9 @@ where
             return Err(GptError::OutOfBounds);
         }
 
-        unsafe { self.read_from_device::<GptPartition>(self.partition_offset(part_id)) }
+        let (primary, _) = self.partition_offset(part_id);
+
+        unsafe { self.read_from_device::<GptPartition>(primary) }
     }
 
     fn iter_entries(&self) -> GptPartitionsIterator<'_, D, S> {
@@ -398,9 +416,15 @@ where
         }
     }
 
-    fn partition_offset(&self, part_id: u32) -> u64 {
-        self.header.partition_start_lba() * S
-            + u64::from(part_id * self.header.partition_entry_size())
+    fn partition_offset(&self, part_id: u32) -> (u64, u64) {
+        let offset_in_table = u64::from(part_id * self.header.partition_entry_size());
+        let primary_offset = self.header.partition_start_lba() * S + offset_in_table;
+
+        let alternate_offset = S * self.header.alternate_lba()
+            - u64::from(self.header.partition_entries_count() * self.header.partition_entry_size())
+            + offset_in_table;
+
+        (primary_offset, alternate_offset)
     }
 
     fn find_first_empty_slot(&self) -> Option<u32> {
@@ -414,30 +438,20 @@ impl<D, const S: u64> Gpt<D, S>
 where
     D: DiskRead + DiskWrite + DiskSeek,
 {
-    pub fn restore_main_header_from_alternate(&mut self) -> Result<(), GptError> {
-        let alternate = self.read_alternate()?;
-        self.header = alternate;
-
-        self.write_header()?;
+    pub fn restore_from_alternate(&mut self) -> Result<(), GptError> {
+        self.restore_main_header_from_alternate()?;
+        self.restore_partitions_from_alternate()?;
 
         Ok(())
-    }
-
-    fn write_header(&mut self) -> Result<(), GptError> {
-        self.write_to_device::<GptHeader>(S * self.header.lba(), self.header.clone())
-    }
-
-    fn update_alternate(&mut self) -> Result<(), GptError> {
-        self.write_to_device(S * self.header.alternate_lba(), self.header.clone())
     }
 
     pub fn remove_partition(&mut self, part_id: u32) -> Result<(), GptError> {
         self.get_partition(part_id)?;
 
-        self.write_to_device(
-            self.partition_offset(part_id),
-            [0u8; size_of::<GptPartition>()],
-        )?;
+        let (primary, alternate) = self.partition_offset(part_id);
+
+        self.write_to_device(primary, [0u8; size_of::<GptPartition>()])?;
+        self.write_to_device(alternate, [0u8; size_of::<GptPartition>()])?;
 
         self.update_checksums();
 
@@ -493,12 +507,53 @@ where
         self.write_partition_entry(idx, new_part)
     }
 
+    fn restore_partitions_from_alternate(&mut self) -> Result<(), GptError> {
+        let (_, alternate_start) = self.partition_offset(0);
+
+        for part_idx in 0..self.header.partition_entries_count() {
+            unsafe {
+                self.write_partition_entry(
+                    part_idx,
+                    self.read_from_device(
+                        alternate_start
+                            + u64::try_from(
+                                size_of::<GptPartition>()
+                                    * usize::try_from(part_idx).map_err(|_| GptError::IoError)?,
+                            )
+                            .map_err(|_| GptError::IoError)?,
+                    )?,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn restore_main_header_from_alternate(&mut self) -> Result<(), GptError> {
+        let alternate = self.read_alternate()?;
+        self.header = alternate;
+
+        self.write_header()?;
+
+        Ok(())
+    }
+
+    fn write_header(&mut self) -> Result<(), GptError> {
+        self.write_to_device::<GptHeader>(S * self.header.lba(), self.header.clone())
+    }
+
+    fn update_alternate(&mut self) -> Result<(), GptError> {
+        self.write_to_device(S * self.header.alternate_lba(), self.header.clone())
+    }
+
     fn write_partition_entry(
         &mut self,
         entry_id: u32,
         new_part: GptPartition,
     ) -> Result<(), GptError> {
-        self.write_to_device(self.partition_offset(entry_id), new_part)?;
+        let (primary, alternate) = self.partition_offset(entry_id);
+        self.write_to_device(primary, new_part)?;
+        self.write_to_device(alternate, new_part)?;
 
         self.update_checksums();
         self.update_alternate()?;
@@ -641,12 +696,13 @@ mod tests {
 
         let mut part_a = gpt.get_partition(0).unwrap();
         part_a.set_start_lba(2727);
+        part_a.set_name("frost").unwrap();
 
         gpt.update_partition(0, part_a).unwrap();
 
         let partitions = gpt.iter_partitions().collect::<Vec<_>>();
 
-        assert_eq!(partitions[0].name().unwrap(), "part_a");
+        assert_eq!(partitions[0].name().unwrap(), "frost");
 
         assert_eq!(partitions[0].start_lba(), 2727);
 
@@ -665,5 +721,25 @@ mod tests {
         assert_eq!(partitions.len(), 1);
 
         assert_eq!(partitions[0].name().unwrap(), "part_b");
+    }
+
+    #[test]
+    pub fn gpt_alternate_partition_offset() {
+        let gpt_dump = Cursor::new(GPT_DUMP);
+        let gpt: Gpt<Cursor<&[u8]>> = Gpt::parse_from_device(gpt_dump).unwrap();
+
+        let (primary, alternate) = gpt.partition_offset(0);
+
+        assert_eq!(
+            alternate - gpt.header.last_usable_lba() * 0x200,
+            primary - 0x200
+        );
+
+        let (primary, alternate) = gpt.partition_offset(1);
+
+        assert_eq!(
+            alternate - gpt.header.last_usable_lba() * 0x200,
+            primary - 0x200
+        );
     }
 }

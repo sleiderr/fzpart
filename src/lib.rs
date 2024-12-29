@@ -3,11 +3,11 @@
 #[macro_use]
 extern crate static_assertions;
 
-mod gpt;
 pub mod mbr;
 pub use mbr::{Mbr, MbrInplace, MbrPartition};
 
-pub use gpt::{Gpt, GptHeader};
+pub mod gpt;
+pub use gpt::{Gpt, GptHeader, GptPartition};
 
 extern crate alloc;
 
