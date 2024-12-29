@@ -33,7 +33,7 @@ pub enum GptPartitionError {
     InvalidName,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(packed(1), C)]
 pub struct GptHeader {
     /// Identifies EFI-compatible partition table header.
@@ -315,6 +315,36 @@ where
         Ok(())
     }
 
+    unsafe fn read_from_device<T>(&self, offset: u64) -> Result<T, GptError> {
+        let mut device = self.device_mapping.borrow_mut();
+        device
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| GptError::IoError)?;
+
+        let data = unsafe {
+            let mut uninit_data: MaybeUninit<T> = MaybeUninit::uninit();
+
+            let read = device
+                .read(slice::from_raw_parts_mut(
+                    uninit_data.as_mut_ptr().cast(),
+                    size_of::<T>(),
+                ))
+                .map_err(|_| GptError::IoError)?;
+
+            if read != size_of::<T>() {
+                return Err(GptError::IoError);
+            }
+
+            uninit_data.assume_init()
+        };
+
+        Ok(data)
+    }
+
+    fn read_alternate(&self) -> Result<GptHeader, GptError> {
+        unsafe { self.read_from_device(S * self.header.alternate_lba()) }
+    }
+
     fn would_new_partitions_overlap(&self, new_part: Vec<GptPartition>) -> bool {
         let mut partitions = self.iter_partitions().collect::<Vec<_>>();
         partitions.extend(new_part.into_iter());
@@ -353,35 +383,11 @@ where
     }
 
     fn read_partition_entry(&self, part_id: u32) -> Result<GptPartition, GptError> {
-        self.device_mapping
-            .borrow_mut()
-            .seek(SeekFrom::Start(self.partition_offset(part_id)))
-            .map_err(|_| GptError::IoError)?;
-
         if part_id >= self.header.partition_entry_size() {
             return Err(GptError::OutOfBounds);
         }
 
-        let part = unsafe {
-            let mut uninit_part: MaybeUninit<GptPartition> = MaybeUninit::uninit();
-
-            let bytes_read = self
-                .device_mapping
-                .borrow_mut()
-                .read(slice::from_raw_parts_mut(
-                    uninit_part.as_mut_ptr().cast(),
-                    size_of::<GptPartition>(),
-                ))
-                .map_err(|_| GptError::IoError)?;
-
-            if bytes_read != size_of::<GptPartition>() {
-                return Err(GptError::OutOfBounds);
-            }
-
-            uninit_part.assume_init()
-        };
-
-        Ok(part)
+        unsafe { self.read_from_device::<GptPartition>(self.partition_offset(part_id)) }
     }
 
     fn iter_entries(&self) -> GptPartitionsIterator<'_, D, S> {
@@ -404,27 +410,36 @@ where
     }
 }
 
-impl<D> Gpt<D>
+impl<D, const S: u64> Gpt<D, S>
 where
     D: DiskRead + DiskWrite + DiskSeek,
 {
+    pub fn restore_main_header_from_alternate(&mut self) -> Result<(), GptError> {
+        let alternate = self.read_alternate()?;
+        self.header = alternate;
+
+        self.write_header()?;
+
+        Ok(())
+    }
+
+    fn write_header(&mut self) -> Result<(), GptError> {
+        self.write_to_device::<GptHeader>(S * self.header.lba(), self.header.clone())
+    }
+
+    fn update_alternate(&mut self) -> Result<(), GptError> {
+        self.write_to_device(S * self.header.alternate_lba(), self.header.clone())
+    }
+
     pub fn remove_partition(&mut self, part_id: u32) -> Result<(), GptError> {
         self.get_partition(part_id)?;
 
-        self.device_mapping
-            .borrow_mut()
-            .seek(SeekFrom::Start(self.partition_offset(part_id)))
-            .map_err(|_| GptError::IoError)?;
+        self.write_to_device(
+            self.partition_offset(part_id),
+            [0u8; size_of::<GptPartition>()],
+        )?;
 
-        let bytes_written = self
-            .device_mapping
-            .borrow_mut()
-            .write(&[0u8; size_of::<GptPartition>()])
-            .map_err(|_| GptError::IoError)?;
-
-        if bytes_written != size_of::<GptPartition>() {
-            return Err(GptError::IoError);
-        }
+        self.update_checksums();
 
         Ok(())
     }
@@ -483,22 +498,28 @@ where
         entry_id: u32,
         new_part: GptPartition,
     ) -> Result<(), GptError> {
+        self.write_to_device(self.partition_offset(entry_id), new_part)?;
+
+        self.update_checksums();
+        self.update_alternate()?;
+
+        Ok(())
+    }
+
+    fn write_to_device<T>(&mut self, offset: u64, obj: T) -> Result<(), GptError> {
         self.device_mapping
             .borrow_mut()
-            .seek(SeekFrom::Start(self.partition_offset(entry_id)))
+            .seek(SeekFrom::Start(offset))
             .map_err(|_| GptError::IoError)?;
 
         let bytes_written = unsafe {
             self.device_mapping
                 .borrow_mut()
-                .write(slice::from_raw_parts(
-                    addr_of!(new_part).cast(),
-                    size_of::<GptPartition>(),
-                ))
+                .write(slice::from_raw_parts(addr_of!(obj).cast(), size_of::<T>()))
                 .map_err(|_| GptError::IoError)?
         };
 
-        if bytes_written != size_of::<GptPartition>() {
+        if bytes_written != size_of::<T>() {
             return Err(GptError::IoError);
         }
 
@@ -606,11 +627,11 @@ mod tests {
 
         let partitions = gpt.iter_partitions().collect::<Vec<_>>();
 
-        std::println!("{:?}", partitions);
-
         assert_eq!(partitions[2].name().unwrap(), "part_a");
 
         assert_eq!(partitions[2].start_lba(), 27272727);
+
+        assert_eq!(gpt.read_alternate().unwrap(), gpt.header);
     }
 
     #[test]
@@ -628,6 +649,8 @@ mod tests {
         assert_eq!(partitions[0].name().unwrap(), "part_a");
 
         assert_eq!(partitions[0].start_lba(), 2727);
+
+        assert_eq!(gpt.read_alternate().unwrap(), gpt.header);
     }
 
     #[test]
