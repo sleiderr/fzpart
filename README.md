@@ -4,8 +4,18 @@
 
 ## Features
 
-- Read / write a disk MBR (bootcode, partition table)
-- Interact with the MBR using a raw bytes buffer (useful for bootloaders)
+- **MBR Support**:
+  - Read / write a disk Master Boot Record (bootcode and partition table).
+  - Interact with the MBR using a raw bytes buffer (useful for bootloaders).
+
+- **GPT Support**:
+  - Parse, validate, and modify GUID Partition Tables (GPT).
+  - Read and write GPT headers and partition entries.
+  - Perform checksum validation and updates for integrity.
+  - Manage partitions, including adding, updating, and removing entries.
+  - Ensure the consistency of the partition table.
+
+- Supports both `#![no-std]` / `no-alloc` and `std` environments, with almost no loss of functionalities.
 
 ## Usage
 
@@ -13,8 +23,17 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-fzpart = "0.0.1"
+fzpart = "0.2.0"
 ```
+
+## Flags
+
+This crate has the following Cargo features:
+
+- `std` (default): Relies on `std` whenever possible, instead of manual implementations (`std::io` to interact with devices, ...).
+                   Also offers a few minor additional methods.
+- `alloc` (default): Enables usage of the `alloc` crate, when a global allocator is available. This offers some additional
+                     functionalities (partition names conversion, additional consistency checks).
 
 ## Contribution
 

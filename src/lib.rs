@@ -1,3 +1,12 @@
+//! A Rust library to interact with GPT / MBR partition tables.
+//!
+//! It provides a set of tools to interact with storage devices at the partition table level,
+//! supporting both Master Boot Record (MBR) and GUID Partition Table (GPT) formats.
+//!
+//! The library is designed to make it easy to read, write, and manipulate partition tables
+//! for a variety of use cases, such as bootloader development, disk management utilities, or
+//! storage diagnostics.
+
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
