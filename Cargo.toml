@@ -6,13 +6,15 @@ authors = ["Sacha Dupuydauby <sdupuydauby@proton.me>"]
 keywords = ["mbr", "gpt", "partition", "boot"]
 categories = ["filesystem", "no-std"]
 repository = "https://github.com/sleiderr/fzpart"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [dependencies]
 crc32fast = { version = "1.4.2", default-features = false }
 static_assertions = "1.1.0"
 uuid = { version = "1.11", features = ["v4", "fast-rng"], optional = true }
+zerocopy = "0.8"
+zerocopy-derive = "0.8"
 
 [dev-dependencies]
 base64 = "0.22"
@@ -20,7 +22,7 @@ base64 = "0.22"
 [features]
 std = ["alloc", "crc32fast/std", "dep:uuid"]
 alloc = []
-default = ["std"]
+default = ["alloc", "std"]
 
 [package.metadata.docs.rs]
 all-features = true

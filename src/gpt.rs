@@ -65,16 +65,14 @@
 //! assert_eq!(gpt.get_partition(0).unwrap().start_lba(), 400);
 //! ```
 
-use core::{
-    cell::RefCell,
-    mem::MaybeUninit,
-    ptr::{addr_of, from_ref},
-    slice::{self, from_raw_parts},
-};
+use core::{cell::RefCell, mem::MaybeUninit, slice};
+use std::mem::offset_of;
 
 #[cfg(feature = "alloc")]
 use alloc::{string::String, vec::Vec};
 use crc32fast::Hasher;
+use zerocopy::{FromBytes, Immutable, IntoBytes};
+use zerocopy_derive::{FromBytes, Immutable, IntoBytes};
 
 use crate::{DiskRead, DiskSeek, DiskWrite, SeekFrom};
 
@@ -205,7 +203,7 @@ pub enum GptPartitionError {
 /// assert_eq!(gpt.header.first_usable_lba(), 400);
 /// assert_eq!(gpt.header.compute_checksum(), gpt.header.checksum());
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable)]
 #[repr(packed(1), C)]
 pub struct GptHeader {
     /// Identifies EFI-compatible partition table header.
@@ -220,6 +218,7 @@ pub struct GptHeader {
 
     /// CRC32 checksum for the header.
     checksum: u32,
+
     reserved: [u8; 4],
 
     /// The LBA that contains this structure.
@@ -271,21 +270,16 @@ impl GptHeader {
     /// ```
     #[must_use]
     pub fn compute_checksum(&self) -> u32 {
-        let chksum_field = self.checksum;
+        let chksum_offset = offset_of!(GptHeader, checksum);
+        let bytes = self.as_bytes();
 
-        unsafe {
-            addr_of!(self.checksum).cast::<u32>().cast_mut().write(0);
-            let hash = crc32fast::hash(from_raw_parts(
-                from_ref(self).cast(),
-                size_of::<GptHeader>(),
-            ));
-            addr_of!(self.checksum)
-                .cast::<u32>()
-                .cast_mut()
-                .write(chksum_field);
+        let mut crc32_hasher = Hasher::new();
 
-            hash
-        }
+        crc32_hasher.update(&bytes[..chksum_offset]);
+        crc32_hasher.update(&[0u8; size_of::<u32>()]);
+        crc32_hasher.update(&bytes[chksum_offset + size_of::<u32>()..]);
+
+        crc32_hasher.finalize()
     }
 
     fn update_checksum(&mut self) {
@@ -365,7 +359,7 @@ impl GptHeader {
 /// assert_eq!(part.name().unwrap(), "my_part");
 /// assert_eq!(part.size(), 3072);
 /// ```
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
 #[repr(packed(1), C)]
 pub struct GptPartition {
     /// Defines the purpose and type of this partition.
@@ -628,17 +622,11 @@ where
             .seek(SeekFrom::Start(GPT_HEADER_OFFSET))
             .map_err(|_| GptError::IoError)?;
 
-        let header = unsafe {
-            let mut uninit_header: MaybeUninit<GptHeader> = MaybeUninit::uninit();
-            device_mapping
-                .read(slice::from_raw_parts_mut(
-                    uninit_header.as_mut_ptr().cast(),
-                    size_of::<GptHeader>(),
-                ))
-                .map_err(|_| GptError::IoError)?;
-
-            uninit_header.assume_init()
-        };
+        let mut buf = [0u8; size_of::<GptHeader>()];
+        device_mapping
+            .read(&mut buf)
+            .map_err(|_| GptError::IoError)?;
+        let header = GptHeader::read_from_bytes(&buf).map_err(|_| GptError::IoError)?;
 
         header.is_valid()?;
 
@@ -793,46 +781,54 @@ where
     fn compute_partitions_checksum(&self) -> u32 {
         let mut crc32_hasher = Hasher::new();
 
-        unsafe {
-            self.iter_entries().for_each(|part| {
-                crc32_hasher.update(slice::from_raw_parts(
-                    addr_of!(part).cast(),
-                    size_of::<GptPartition>(),
-                ));
-            });
-        }
+        self.iter_entries()
+            .for_each(|part| crc32_hasher.update(part.as_bytes()));
 
         crc32_hasher.finalize()
     }
 
-    unsafe fn read_from_device<T>(&self, offset: u64) -> Result<T, GptError> {
+    fn read_from_device<T>(&self, offset: u64) -> Result<T, GptError>
+    where
+        T: FromBytes,
+    {
         let mut device = self.device_mapping.borrow_mut();
         device
             .seek(SeekFrom::Start(offset))
             .map_err(|_| GptError::IoError)?;
 
-        let data = unsafe {
-            let mut uninit_data: MaybeUninit<T> = MaybeUninit::uninit();
+        #[cfg(feature = "alloc")]
+        if cfg!(feature = "alloc") {
+            let mut buf = alloc::vec![0u8; size_of::<T>()];
 
-            let read = device
-                .read(slice::from_raw_parts_mut(
-                    uninit_data.as_mut_ptr().cast(),
-                    size_of::<T>(),
-                ))
-                .map_err(|_| GptError::IoError)?;
+            let read = device.read(&mut buf).map_err(|_| GptError::IoError)?;
 
             if read != size_of::<T>() {
                 return Err(GptError::IoError);
             }
 
-            uninit_data.assume_init()
-        };
+            T::read_from_bytes(&buf).map_err(|_| GptError::IoError)
+        } else {
+            unsafe {
+                let mut uninit_data: MaybeUninit<T> = MaybeUninit::uninit();
 
-        Ok(data)
+                let read = device
+                    .read(slice::from_raw_parts_mut(
+                        uninit_data.as_mut_ptr().cast(),
+                        size_of::<T>(),
+                    ))
+                    .map_err(|_| GptError::IoError)?;
+
+                if read != size_of::<T>() {
+                    return Err(GptError::IoError);
+                }
+
+                Ok(uninit_data.assume_init())
+            }
+        }
     }
 
     fn read_alternate(&self) -> Result<GptHeader, GptError> {
-        unsafe { self.read_from_device(S * self.header.alternate_lba()) }
+        self.read_from_device(S * self.header.alternate_lba())
     }
 
     fn would_new_partitions_overlap(&self, new_part: Vec<GptPartition>) -> bool {
@@ -851,7 +847,7 @@ where
 
         let (primary, _) = self.partition_offset(part_id);
 
-        unsafe { self.read_from_device::<GptPartition>(primary) }
+        self.read_from_device::<GptPartition>(primary)
     }
 
     fn iter_entries(&self) -> GptPartitionsIterator<'_, D, S> {
@@ -1155,19 +1151,17 @@ where
         let (_, alternate_start) = self.partition_offset(0);
 
         for part_idx in 0..self.header.partition_entries_count() {
-            unsafe {
-                self.write_partition_entry(
-                    part_idx,
-                    &self.read_from_device::<GptPartition>(
-                        alternate_start
-                            + u64::try_from(
-                                size_of::<GptPartition>()
-                                    * usize::try_from(part_idx).map_err(|_| GptError::IoError)?,
-                            )
-                            .map_err(|_| GptError::IoError)?,
-                    )?,
-                )?;
-            }
+            self.write_partition_entry(
+                part_idx,
+                &self.read_from_device::<GptPartition>(
+                    alternate_start
+                        + u64::try_from(
+                            size_of::<GptPartition>()
+                                * usize::try_from(part_idx).map_err(|_| GptError::IoError)?,
+                        )
+                        .map_err(|_| GptError::IoError)?,
+                )?,
+            )?;
         }
 
         Ok(())
@@ -1206,18 +1200,20 @@ where
         Ok(())
     }
 
-    fn write_to_device<T>(&mut self, offset: u64, obj: &T) -> Result<(), GptError> {
+    fn write_to_device<T>(&mut self, offset: u64, obj: &T) -> Result<(), GptError>
+    where
+        T: IntoBytes + Immutable,
+    {
         self.device_mapping
             .borrow_mut()
             .seek(SeekFrom::Start(offset))
             .map_err(|_| GptError::IoError)?;
 
-        let bytes_written = unsafe {
-            self.device_mapping
-                .borrow_mut()
-                .write(slice::from_raw_parts(from_ref(obj).cast(), size_of::<T>()))
-                .map_err(|_| GptError::IoError)?
-        };
+        let bytes_written = self
+            .device_mapping
+            .borrow_mut()
+            .write(obj.as_bytes())
+            .map_err(|_| GptError::IoError)?;
 
         if bytes_written != size_of::<T>() {
             return Err(GptError::IoError);
