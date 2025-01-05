@@ -6,7 +6,7 @@ authors = ["Sacha Dupuydauby <sdupuydauby@proton.me>"]
 keywords = ["mbr", "gpt", "partition", "boot"]
 categories = ["filesystem", "no-std"]
 repository = "https://github.com/sleiderr/fzpart"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 [dependencies]

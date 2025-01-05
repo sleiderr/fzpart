@@ -65,8 +65,11 @@
 //! assert_eq!(gpt.get_partition(0).unwrap().start_lba(), 400);
 //! ```
 
-use core::{cell::RefCell, mem::MaybeUninit, slice};
-use std::mem::offset_of;
+use core::{
+    cell::RefCell,
+    mem::{offset_of, MaybeUninit},
+    slice,
+};
 
 #[cfg(feature = "alloc")]
 use alloc::{string::String, vec::Vec};
@@ -796,7 +799,6 @@ where
             .seek(SeekFrom::Start(offset))
             .map_err(|_| GptError::IoError)?;
 
-        #[cfg(feature = "alloc")]
         if cfg!(feature = "alloc") {
             let mut buf = alloc::vec![0u8; size_of::<T>()];
 
@@ -831,6 +833,7 @@ where
         self.read_from_device(S * self.header.alternate_lba())
     }
 
+    #[cfg(feature = "alloc")]
     fn would_new_partitions_overlap(&self, new_part: Vec<GptPartition>) -> bool {
         let mut partitions = self.iter_partitions().collect::<Vec<_>>();
         partitions.extend(new_part);
@@ -1275,6 +1278,7 @@ fn find_overlapping_partitions(mut partitions: Vec<GptPartition>) -> Vec<Vec<Gpt
 }
 
 #[cfg(test)]
+#[cfg(feature = "std")]
 mod tests {
     use std::{io::Cursor, vec::Vec};
 
