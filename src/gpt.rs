@@ -356,7 +356,7 @@ impl GptHeader {
 /// let mut part = GptPartition::default();
 ///
 /// part.set_start_lba(1024);
-/// part.set_last_lba(4096);
+/// part.set_last_lba(4095);
 /// part.set_name("my_part");
 ///
 /// assert_eq!(part.name().unwrap(), "my_part");
@@ -398,12 +398,12 @@ impl GptPartition {
     /// let mut part = GptPartition::default();
     ///
     /// part.set_start_lba(1024);
-    /// part.set_last_lba(4096);
+    /// part.set_last_lba(4095);
     ///
     /// assert_eq!(part.size(), 3072);
     /// ```
     pub fn size(&self) -> u64 {
-        self.last_lba - self.start_lba
+        self.last_lba - self.start_lba + 1
     }
 
     /// Returns `true` if this partition is being used.
